@@ -1,0 +1,52 @@
+diff --git a/www/manager6/sdn/dns/TechnitiumEdit.js b/www/manager6/sdn/dns/TechnitiumEdit.js
+new file mode 100644
+index 00000000..229f6e55
+--- /dev/null
++++ b/www/manager6/sdn/dns/TechnitiumEdit.js
+@@ -0,0 +1,46 @@
++Ext.define('PVE.sdn.dns.TechnitiumInputPanel', {
++    extend: 'PVE.panel.SDNDnsBase',
++    onGetValues: function (values) {
++        var me = this;
++        if (me.isCreate) {
++            values.type = me.type;
++        } else {
++            delete values.dns;
++        }
++        return values;
++    },
++    initComponent: function () {
++        var me = this;
++        me.column1 = [
++            {
++                xtype: me.isCreate ? 'textfield' : 'displayfield',
++                name: 'dns',
++                maxLength: 10,
++                value: me.dns || '',
++                fieldLabel: 'ID',
++                allowBlank: false,
++            },
++            {
++                xtype: 'textfield',
++                name: 'apitoken',
++                fieldLabel: gettext('API Token'),
++                allowBlank: false,
++            },
++        ];
++        me.column2 = [
++            {
++                xtype: 'textfield',
++                name: 'server',
++                fieldLabel: gettext('Server URL'),
++                allowBlank: false,
++            },
++            {
++                xtype: 'proxmoxintegerfield',
++                name: 'ttl',
++                fieldLabel: 'TTL',
++                allowBlank: true,
++            },
++        ];
++        me.callParent();
++    },
++});

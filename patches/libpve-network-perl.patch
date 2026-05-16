@@ -1,0 +1,207 @@
+diff --git a/src/PVE/Network/SDN/Dns/TechnitiumPlugin.pm b/src/PVE/Network/SDN/Dns/TechnitiumPlugin.pm
+new file mode 100644
+index 0000000..da83fbc
+--- /dev/null
++++ b/src/PVE/Network/SDN/Dns/TechnitiumPlugin.pm
+@@ -0,0 +1,201 @@
++package PVE::Network::SDN::Dns::TechnitiumPlugin;
++
++use strict;
++use warnings;
++
++use JSON;
++use Net::IP;
++use NetAddr::IP qw(:lower);
++use URI::Escape;
++
++use PVE::Cluster;
++use PVE::INotify;
++use PVE::Tools;
++
++use base('PVE::Network::SDN::Dns::Plugin');
++
++sub type {
++    return 'technitium';
++}
++
++sub properties {
++    return {
++        server => {
++            type        => 'string',
++            description => 'Base URL of the Technitium DNS server (e.g. http://ns.internal:5380)',
++        },
++        apitoken => {
++            type        => 'string',
++            description => 'Technitium API token',
++        },
++    };
++}
++
++sub options {
++    return {
++        server      => { optional => 0 },
++        apitoken    => { optional => 0 },
++        ttl         => { optional => 1 },
++        fingerprint => { optional => 1 },
++    };
++}
++
++# Internal helper — makes a GET request to the Technitium API and dies on error
++my sub technitium_api_request {
++    my ($config, $path, $params) = @_;
++
++    my $base   = $config->{server};
++    my $token  = $config->{apitoken};
++
++    # Build query string
++    my $qs = "token=" . uri_escape($token);
++    for my $k (sort keys %{ $params // {} }) {
++        $qs .= "&" . uri_escape($k) . "=" . uri_escape($params->{$k});
++    }
++
++    my $url = "${base}${path}?${qs}";
++
++    my $ua = LWP::UserAgent->new(timeout => 10);
++    my $response = $ua->get($url);
++
++    die "HTTP request failed: " . $response->status_line . "\n"
++        unless $response->is_success;
++
++    my $data = eval { decode_json($response->decoded_content) };
++    die "Failed to parse JSON response: $@\n" if $@;
++
++    if ($data->{status} ne 'ok') {
++        die $data->{errorMessage} // "Unknown API error\n";
++    }
++
++    return $data;
++}
++
++# Plugin implementation
++
++sub add_a_record {
++    my ($class, $plugin_config, $zone, $hostname, $ip, $noerr) = @_;
++
++    my $ttl  = $plugin_config->{ttl} // 3600;
++    my $type = Net::IP::ip_is_ipv6($ip) ? 'AAAA' : 'A';
++    my $fqdn = "${hostname}.${zone}";
++
++    my $params = {
++        domain    => $fqdn,
++        type      => $type,
++        ipAddress => $ip,
++        ttl       => $ttl,
++    };
++
++    eval { technitium_api_request($plugin_config, '/api/zones/records/add', $params) };
++    die "error adding $fqdn to zone $zone: $@" if $@ && !$noerr;
++}
++
++sub add_ptr_record {
++    my ($class, $plugin_config, $zone, $hostname, $ip, $noerr) = @_;
++
++    my $ttl       = $plugin_config->{ttl} // 3600;
++    my $reverseip = Net::IP->new($ip)->reverse_ip();
++    # strip trailing dot — Technitium doesn't want it on the domain param
++    $reverseip =~ s/\.$//;
++    my $fqdn = "${hostname}.${zone}";
++
++    my $params = {
++        domain  => $reverseip,
++        type    => 'PTR',
++        ptrName => $fqdn,
++        ttl     => $ttl,
++    };
++
++    eval { technitium_api_request($plugin_config, '/api/zones/records/add', $params) };
++    die "error adding PTR for $ip to zone $zone: $@" if $@ && !$noerr;
++}
++
++sub del_a_record {
++    my ($class, $plugin_config, $zone, $hostname, $ip, $noerr) = @_;
++
++    my $type = Net::IP::ip_is_ipv6($ip) ? 'AAAA' : 'A';
++    my $fqdn = "${hostname}.${zone}";
++
++    my $params = {
++        domain    => $fqdn,
++        type      => $type,
++        ipAddress => $ip,
++    };
++
++    eval { technitium_api_request($plugin_config, '/api/zones/records/delete', $params) };
++    die "error deleting $fqdn from zone $zone: $@" if $@ && !$noerr;
++}
++
++sub del_ptr_record {
++    my ($class, $plugin_config, $zone, $ip, $noerr) = @_;
++
++    my $reverseip = Net::IP->new($ip)->reverse_ip();
++    $reverseip =~ s/\.$//;
++
++    my $params = {
++        domain => $reverseip,
++        type   => 'PTR',
++    };
++
++    eval { technitium_api_request($plugin_config, '/api/zones/records/delete', $params) };
++    die "error deleting PTR for $ip from zone $zone: $@" if $@ && !$noerr;
++}
++
++sub verify_zone {
++    my ($class, $plugin_config, $zone, $noerr) = @_;
++
++    eval {
++        technitium_api_request($plugin_config, '/api/zones/records/get', { domain => $zone });
++    };
++    die "can't verify zone $zone: $@" if $@ && !$noerr;
++}
++
++sub get_reversedns_zone {
++    my ($class, $plugin_config, $subnetid, $subnet, $ip) = @_;
++
++    my $cidr = $subnet->{cidr};
++    my $mask = $subnet->{mask};
++    my $zone = "";
++
++    if (Net::IP::ip_is_ipv4($ip)) {
++        my ($b1, $b2, $b3, $b4) = split(/\./, $ip);
++        my $ipv4 = NetAddr::IP->new($cidr);
++
++        if ($ipv4->is_rfc1918()) {
++            if ($b1 == 192) {
++                $zone = "168.192.in-addr.arpa";
++            } elsif ($b1 == 172) {
++                $zone = "16-31.172.in-addr.arpa";
++            } elsif ($b1 == 10) {
++                $zone = "10.in-addr.arpa";
++            }
++        } else {
++            if ($mask <= 24) {
++                $zone = "$b3.$b2.$b1.in-addr.arpa";
++            } elsif ($mask <= 16) {
++                $zone = "$b2.$b1.in-addr.arpa";
++            } elsif ($mask <= 8) {
++                $zone = "$b1.in-addr.arpa";
++            }
++        }
++    } else {
++        $mask = $plugin_config->{reversemaskv6} if $plugin_config->{reversemaskv6};
++        die "reverse dns zone mask must be a multiple of 4\n" if ($mask % 4);
++        my $networkv6 = NetAddr::IP->new($cidr)->network();
++        $zone = Net::IP->new($networkv6)->reverse_ip();
++        $zone =~ s/\.$//;
++    }
++
++    return $zone;
++}
++
++sub on_update_hook {
++    my ($class, $plugin_config) = @_;
++
++    eval { technitium_api_request($plugin_config, '/api/user/session/get', {}) };
++    die "Technitium API error: $@" if $@;
++}
++
++1;
++
